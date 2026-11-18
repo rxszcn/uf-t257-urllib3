@@ -384,3 +384,88 @@ class TestConnection:
             conn.putheader("X-Test", "a", "b")
 
         http_client_putheader.assert_called_once_with("X-Test", "a", "b")
+
+    @staticmethod
+    def _capture_request_wire(body: typing.Any, chunked: bool) -> bytes:
+        """Send a request with a mocked send() and return everything
+        that would have been written to the wire, headers included."""
+        conn = HTTPConnection("")
+        with mock.patch.object(conn, "send") as mock_send:
+            conn.request("POST", "/", body=body, chunked=chunked)
+        return b"".join(call.args[0] for call in mock_send.call_args_list)
+
+    @staticmethod
+    def _parse_chunked_wire(wire: bytes) -> list[bytes]:
+        """Parse a chunked-encoded wire stream per RFC 9112, asserting that
+        every declared chunk-size matches the actual payload byte count."""
+        chunks = []
+        pos = 0
+        while True:
+            header_end = wire.index(b"\r\n", pos)
+            declared = int(wire[pos:header_end], 16)
+            pos = header_end + 2
+            if declared == 0:
+                assert wire[pos : pos + 2] == b"\r\n"
+                assert pos + 2 == len(wire)
+                break
+            payload = wire[pos : pos + declared]
+            assert len(payload) == declared
+            assert wire[pos + declared : pos + declared + 2] == b"\r\n"
+            chunks.append(payload)
+            pos += declared + 2
+        return chunks
+
+    def test_chunked_multidim_memoryview_declares_byte_length(self) -> None:
+        # A 2-D memoryview has len() == 2 (first dimension) but 8 bytes
+        # of payload; the chunk-size on the wire must be the byte count.
+        payload = b"12345678"
+        mv = memoryview(payload).cast("B", (2, 4))
+        assert len(mv) == 2 and mv.nbytes == 8
+
+        sent = self._capture_request_wire(mv, chunked=True)
+        wire_body = sent[sent.index(b"\r\n\r\n") + 4 :]
+
+        chunks = self._parse_chunked_wire(wire_body)
+        assert chunks == [payload]
+        assert wire_body == b"8\r\n12345678\r\n0\r\n\r\n"
+
+    def test_chunked_multidim_memoryview_iterable_splits_per_chunk(self) -> None:
+        # Per-dimension slices of a multi-dimensional view (e.g. rows)
+        # yielded as an iterable body must each declare their own byte count.
+        mv1 = memoryview(b"1234").cast("B", (2, 2))
+        mv2 = memoryview(b"5678").cast("B", (2, 2))
+
+        sent = self._capture_request_wire([mv1, mv2], chunked=True)
+        wire_body = sent[sent.index(b"\r\n\r\n") + 4 :]
+
+        chunks = self._parse_chunked_wire(wire_body)
+        assert chunks == [b"1234", b"5678"]
+        assert wire_body == b"4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"12345678",
+            memoryview(b"12345678"),
+            bytearray(b"12345678"),
+        ],
+        ids=["bytes", "memoryview-1d", "bytearray"],
+    )
+    def test_chunked_bytes_like_wire_bytes_unchanged(self, body: typing.Any) -> None:
+        # Control group: bytes and single-dimension byte-format views
+        # produce exactly the same chunked wire bytes as before the fix.
+        sent = self._capture_request_wire(body, chunked=True)
+        wire_body = sent[sent.index(b"\r\n\r\n") + 4 :]
+        assert wire_body == b"8\r\n12345678\r\n0\r\n\r\n"
+
+    def test_multidim_memoryview_content_length_unchanged(self) -> None:
+        # Control group: the Content-Length path already used nbytes and
+        # must keep sending the payload raw, without chunk framing.
+        mv = memoryview(b"12345678").cast("B", (2, 4))
+
+        sent = self._capture_request_wire(mv, chunked=False)
+        headers, _, wire_body = sent.partition(b"\r\n\r\n")
+
+        assert b"Content-Length: 8" in headers
+        assert b"Transfer-Encoding" not in headers
+        assert wire_body == b"12345678"

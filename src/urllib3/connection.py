@@ -602,7 +602,15 @@ class HTTPConnection(_HTTPConnection):
                 if isinstance(chunk, str):
                     chunk = chunk.encode("utf-8")
                 if chunked:
-                    self.send(b"%x\r\n%b\r\n" % (len(chunk), chunk))
+                    # len() of a memoryview counts elements (of the first
+                    # dimension), not bytes. The chunk-size on the wire must
+                    # be the payload's byte count or the peer's chunked
+                    # parser loses sync with the stream.
+                    if isinstance(chunk, memoryview):
+                        chunk_length = chunk.nbytes
+                    else:
+                        chunk_length = len(chunk)
+                    self.send(b"%x\r\n%b\r\n" % (chunk_length, chunk))
                 else:
                     self.send(chunk)
 
